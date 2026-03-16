@@ -1,22 +1,21 @@
 {
   "name": "theia-lsp",
   "displayName": "Theia-LSP",
-  "description": "Connects to external Language Servers (Java, Rust) via TCP.",
-  "version": "0.0.6",
+  "description": "Connects to external Language Servers via TCP, discovered dynamically from SIDECAR_CONFIG.",
+  "version": "0.1.0",
   "publisher": "nikolashack", 
   "engines": {
     "vscode": "^1.105.0"
   },
   "repository": {
   "type": "git",
-  "url": "https://github.com/ls1intum/theia-lsp-extension"
+  "url": "https://github.com/EduIDE/EduIDE-lsp-extension"
   },
   "categories": [
     "Other"
   ],
   "activationEvents": [
-    "onLanguage:rust",
-    "onLanguage:java"
+    "onStartupFinished"
   ],
   "main": "./out/extension.js",
   "contributes": {

@@ -1,88 +1,139 @@
-import { workspace, ExtensionContext, window, OutputChannel, TextDocument } from 'vscode';
+import { workspace, ExtensionContext, TextDocument } from 'vscode';
 import {
   LanguageClient,
   LanguageClientOptions,
-  ServerOptions,
+  ServerOptions
 } from 'vscode-languageclient/node';
 import * as net from 'net';
 
-// Map to manage active Language Clients (one per language).
+interface SidecarEntry {
+  name: string;
+  host: string;
+  port: number;
+  languages?: string[];
+}
+
 const clients: Map<string, LanguageClient> = new Map();
 
-// Configuration map that assigns language IDs to their environment variables and defaults.
-// The operator injects both language-specific (LS_JAVA_HOST) and generic (LS_HOST) env vars.
-const languageServerConfigs = {
-  'rust': {
-    hostEnv: 'LS_RUST_HOST',
-    portEnv: 'LS_RUST_PORT',
-    defaultHost: 'rust-language-server',
-    defaultPort: 5000,
-  },
-  'java': {
-    hostEnv: 'LS_JAVA_HOST',
-    portEnv: 'LS_JAVA_PORT',
-    defaultHost: 'java-language-server',
-    defaultPort: 5000,
+function getSidecarConfig(): SidecarEntry[] {
+  const raw = process.env.SIDECAR_CONFIG;
+  if (!raw) {
+    return [];
   }
-};
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    console.error('[SIDECAR] Failed to parse SIDECAR_CONFIG:', e);
+    return [];
+  }
+}
 
-// Called once when the extension is activated.
-export function activate(context: ExtensionContext) {
-  console.log('[LSSERVICE] Lazy Multi-Language LSP Connector is now active!');
+function getLegacySidecarConfig(): SidecarEntry[] {
+  const legacyConfigs: { lang: string; hostEnv: string; portEnv: string }[] = [
+    { lang: 'java', hostEnv: 'LS_JAVA_HOST', portEnv: 'LS_JAVA_PORT' },
+    { lang: 'rust', hostEnv: 'LS_RUST_HOST', portEnv: 'LS_RUST_PORT' }
+  ];
 
-  function ensureLanguageClient(document: TextDocument): void {
-    const langId = document.languageId as keyof typeof languageServerConfigs;
-    
-    if (languageServerConfigs[langId] && !clients.has(langId)) {
-      console.log(`[LSSERVICE] Language is supported and client is not running`);
-      const config = languageServerConfigs[langId];
-      // Resolution chain: language-specific env -> generic LS_HOST/LS_PORT -> default
-      const host = process.env[config.hostEnv] || process.env['LS_HOST'] || config.defaultHost;
-      const port = parseInt(process.env[config.portEnv] || process.env['LS_PORT'] || `${config.defaultPort}`, 10);
-      
-      console.log(`[LSSERVICE] First file for '${langId}' opened. Starting client to connect to ${host}:${port}`);
-      
-      const serverOptions: ServerOptions = () => {
-        return new Promise((resolve, reject) => {
-          const socket = net.connect({ host, port });
-          socket.on('connect', () => {
-            console.log(`[LSSERVICE] Successfully connected to ${langId} LS at ${host}:${port}`);
-            resolve({ reader: socket, writer: socket });
-          });
-          socket.on('error', (err) => reject(`[LSSERVICE] Socket error for ${langId} LS: ${err.message}`));
-        });
-      };
+  const entries: SidecarEntry[] = [];
+  for (const cfg of legacyConfigs) {
+    const host = process.env[cfg.hostEnv] || process.env['LS_HOST'];
+    const port = process.env[cfg.portEnv] || process.env['LS_PORT'];
+    if (host && port) {
+      entries.push({
+        name: cfg.lang + '-langserver',
+        host,
+        port: parseInt(port, 10),
+        languages: [cfg.lang]
+      });
+    }
+  }
+  return entries;
+}
 
-      const clientOptions: LanguageClientOptions = {
-        documentSelector: [{ scheme: 'file', language: langId }],
-        synchronize: {
-          fileEvents: workspace.createFileSystemWatcher(`**/*.{${getFileExtensions(langId)}}`),
-        },
-      };
+function connectWithRetry(host: string, port: number, languageId: string, maxRetries = 10): Promise<{ reader: net.Socket; writer: net.Socket }> {
+  return new Promise((resolve, reject) => {
+    let attempt = 0;
+    function tryConnect() {
+      attempt++;
+      const socket = net.connect({ host, port });
+      socket.on('connect', () => {
+        console.log(`[SIDECAR] Connected to ${languageId} LS at ${host}:${port} (attempt ${attempt})`);
+        resolve({ reader: socket, writer: socket });
+      });
+      socket.on('error', (err) => {
+        if (attempt >= maxRetries) {
+          reject(new Error(`[SIDECAR] Failed to connect to ${languageId} LS at ${host}:${port} after ${maxRetries} attempts: ${err.message}`));
+          return;
+        }
+        const delay = Math.min(1000 * Math.pow(2, attempt - 1), 30000);
+        console.log(`[SIDECAR] Connection to ${languageId} at ${host}:${port} attempt ${attempt} failed, retrying in ${delay}ms...`);
+        setTimeout(tryConnect, delay);
+      });
+    }
+    tryConnect();
+  });
+}
 
-      const client = new LanguageClient(
-        `${langId}LspConnector`,
-        `${langId.toUpperCase()} Language Server (TCP)`,
-        serverOptions,
-        clientOptions
-      );
+function startClient(languageId: string, entry: SidecarEntry, context: ExtensionContext): void {
+  console.log(`[SIDECAR] Starting client for '${languageId}' → ${entry.host}:${entry.port}`);
 
-      client.start();
-      clients.set(langId, client);
+  const serverOptions: ServerOptions = () => connectWithRetry(entry.host, entry.port, languageId);
+
+  const clientOptions: LanguageClientOptions = {
+    documentSelector: [{ scheme: 'file', language: languageId }]
+  };
+
+  const client = new LanguageClient(
+    `${languageId}-sidecar-lsp`,
+    `${entry.name} (${languageId})`,
+    serverOptions,
+    clientOptions
+  );
+
+  client.start();
+  clients.set(languageId, client);
+  context.subscriptions.push({ dispose: () => { client.stop(); } });
+}
+
+export function activate(context: ExtensionContext): void {
+  console.log('[SIDECAR] Sidecar LSP connector activating...');
+
+  let sidecars = getSidecarConfig();
+  if (sidecars.length === 0) {
+    console.log('[SIDECAR] No SIDECAR_CONFIG found, trying legacy env vars...');
+    sidecars = getLegacySidecarConfig();
+  }
+
+  // Filter to sidecars that have languages (these are language servers)
+  const lsSidecars = sidecars.filter(s => s.languages && s.languages.length > 0);
+  if (lsSidecars.length === 0) {
+    console.log('[SIDECAR] No language server sidecars configured. Extension inactive.');
+    return;
+  }
+
+  console.log(`[SIDECAR] Found ${lsSidecars.length} language server sidecar(s)`);
+
+  // Build language → sidecar mapping
+  const languageMap = new Map<string, SidecarEntry>();
+  for (const sidecar of lsSidecars) {
+    for (const lang of sidecar.languages!) {
+      languageMap.set(lang, sidecar);
+      console.log(`[SIDECAR] Registered: ${lang} → ${sidecar.host}:${sidecar.port}`);
     }
   }
 
-  context.subscriptions.push(workspace.onDidOpenTextDocument(ensureLanguageClient));
-  
-  workspace.textDocuments.forEach(ensureLanguageClient);
-}
-
-function getFileExtensions(languageId: string): string {
-  switch (languageId) {
-    case 'rust': return 'rs';
-    case 'java': return 'java';
-    default: return '';
+  function ensureClient(doc: TextDocument): void {
+    const entry = languageMap.get(doc.languageId);
+    if (entry && !clients.has(doc.languageId)) {
+      startClient(doc.languageId, entry, context);
+    }
   }
+
+  // Lazy connect on file open
+  context.subscriptions.push(workspace.onDidOpenTextDocument(ensureClient));
+
+  // Check already-open documents
+  workspace.textDocuments.forEach(ensureClient);
 }
 
 export function deactivate(): Thenable<void> {
