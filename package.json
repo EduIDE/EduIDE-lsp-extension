@@ -1,8 +1,8 @@
 {
   "name": "theia-lsp",
   "displayName": "Theia-LSP",
-  "description": "Connects to external Language Servers (Java, Rust) via TCP.",
-  "version": "0.0.6",
+  "description": "Connects to external Language Servers via TCP, discovered dynamically from SIDECAR_CONFIG.",
+  "version": "0.1.0",
   "publisher": "nikolashack", 
   "engines": {
     "vscode": "^1.105.0"
@@ -15,8 +15,7 @@
     "Other"
   ],
   "activationEvents": [
-    "onLanguage:rust",
-    "onLanguage:java"
+    "onStartupFinished"
   ],
   "main": "./out/extension.js",
   "contributes": {
