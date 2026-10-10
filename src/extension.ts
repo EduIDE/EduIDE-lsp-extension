@@ -11,9 +11,73 @@ interface SidecarEntry {
   host: string;
   port: number;
   languages?: string[];
+  token?: string;
 }
 
+// Trust model
+// ===========
+// The connection to a language server is a plain TCP socket with no TLS and no
+// server authentication. On a flat/shared network a rogue pod could impersonate
+// the intended language server and drive `workspace/applyEdit` to plant files in
+// the user's workspace.
+//
+// The primary control is network isolation (a Helm NetworkPolicy that keeps the
+// language server reachable only from its own pod). As defense in depth, this
+// client:
+//   - defaults the host to loopback, matching the intended same-pod sidecar
+//     deployment, so a missing/empty host never resolves to an arbitrary peer;
+//   - pins the endpoint: any non-loopback host must be explicitly allowlisted
+//     via the LS_ALLOWED_HOSTS env var, otherwise the client refuses to connect;
+//   - optionally sends a shared handshake token (LS_AUTH_TOKEN or a per-entry
+//     `token`) so a cooperating server can reject unauthenticated clients.
+//
+// Follow-up: real server authentication needs mTLS (or an equivalent
+// authenticated channel). That is intentionally out of scope for this client
+// change and tracked separately.
+
+const DEFAULT_HOST = '127.0.0.1';
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+
 const clients: Map<string, LanguageClient> = new Map();
+
+function isLoopbackHost(host: string): boolean {
+  return LOOPBACK_HOSTS.has(host.toLowerCase());
+}
+
+// Turns an LS_ALLOWED_HOSTS entry into a matcher. Entries are exact host names,
+// optionally with `*` wildcards (e.g. `*.svc.cluster.local`).
+function hostPatternToRegExp(pattern: string): RegExp {
+  const escaped = pattern
+    .trim()
+    .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*/g, '.*');
+  return new RegExp(`^${escaped}$`, 'i');
+}
+
+function getAllowedHostMatchers(): RegExp[] {
+  const raw = process.env.LS_ALLOWED_HOSTS;
+  if (!raw) {
+    return [];
+  }
+  return raw
+    .split(',')
+    .map(s => s.trim())
+    .filter(s => s.length > 0)
+    .map(hostPatternToRegExp);
+}
+
+// Pins the endpoint: loopback is always allowed (the intended sidecar), any
+// other host must match the configured allowlist.
+function isHostAllowed(host: string): boolean {
+  if (isLoopbackHost(host)) {
+    return true;
+  }
+  return getAllowedHostMatchers().some(re => re.test(host));
+}
+
+function resolveAuthToken(entry: SidecarEntry): string | undefined {
+  return entry.token || process.env.LS_AUTH_TOKEN || undefined;
+}
 
 function getSidecarConfig(): SidecarEntry[] {
   const raw = process.env.SIDECAR_CONFIG;
@@ -21,7 +85,13 @@ function getSidecarConfig(): SidecarEntry[] {
     return [];
   }
   try {
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw) as SidecarEntry[];
+    // Default a missing/empty host to loopback (the intended same-pod sidecar)
+    // instead of letting it resolve to an arbitrary peer.
+    return parsed.map(entry => ({
+      ...entry,
+      host: entry.host && entry.host.trim().length > 0 ? entry.host : DEFAULT_HOST
+    }));
   } catch (e) {
     console.error('[SIDECAR] Failed to parse SIDECAR_CONFIG:', e);
     return [];
@@ -36,9 +106,9 @@ function getLegacySidecarConfig(): SidecarEntry[] {
 
   const entries: SidecarEntry[] = [];
   for (const cfg of legacyConfigs) {
-    const host = process.env[cfg.hostEnv] || process.env['LS_HOST'];
+    const host = process.env[cfg.hostEnv] || process.env['LS_HOST'] || DEFAULT_HOST;
     const port = process.env[cfg.portEnv] || process.env['LS_PORT'];
-    if (host && port) {
+    if (port) {
       entries.push({
         name: cfg.lang + '-langserver',
         host,
@@ -50,7 +120,7 @@ function getLegacySidecarConfig(): SidecarEntry[] {
   return entries;
 }
 
-function connectWithRetry(host: string, port: number, languageId: string, maxRetries = 10): Promise<{ reader: net.Socket; writer: net.Socket }> {
+function connectWithRetry(host: string, port: number, languageId: string, token?: string, maxRetries = 10): Promise<{ reader: net.Socket; writer: net.Socket }> {
   return new Promise((resolve, reject) => {
     let attempt = 0;
     function tryConnect() {
@@ -58,6 +128,12 @@ function connectWithRetry(host: string, port: number, languageId: string, maxRet
       const socket = net.connect({ host, port });
       socket.on('connect', () => {
         console.log(`[SIDECAR] Connected to ${languageId} LS at ${host}:${port} (attempt ${attempt})`);
+        // Optional shared-token handshake, sent before the LSP stream starts.
+        // A cooperating server consumes this line and rejects clients without a
+        // valid token. Off by default; no token means the stream is unchanged.
+        if (token) {
+          socket.write(`X-LS-Auth: ${token}\r\n`);
+        }
         resolve({ reader: socket, writer: socket });
       });
       socket.on('error', (err) => {
@@ -75,9 +151,24 @@ function connectWithRetry(host: string, port: number, languageId: string, maxRet
 }
 
 function startClient(languageId: string, entry: SidecarEntry, context: ExtensionContext): void {
+  // Pin the endpoint before connecting. Refuse any host that is neither loopback
+  // nor explicitly allowlisted, so a rogue peer on the network cannot be reached.
+  if (!isHostAllowed(entry.host)) {
+    console.error(
+      `[SIDECAR] Refusing to connect '${languageId}' to untrusted host '${entry.host}'. ` +
+      `Only loopback is allowed by default; add it to LS_ALLOWED_HOSTS to permit it.`
+    );
+    return;
+  }
+  if (!Number.isInteger(entry.port) || entry.port <= 0 || entry.port > 65535) {
+    console.error(`[SIDECAR] Refusing to connect '${languageId}': invalid port '${entry.port}'.`);
+    return;
+  }
+
+  const token = resolveAuthToken(entry);
   console.log(`[SIDECAR] Starting client for '${languageId}' → ${entry.host}:${entry.port}`);
 
-  const serverOptions: ServerOptions = () => connectWithRetry(entry.host, entry.port, languageId);
+  const serverOptions: ServerOptions = () => connectWithRetry(entry.host, entry.port, languageId, token);
 
   const clientOptions: LanguageClientOptions = {
     documentSelector: [{ scheme: 'file', language: languageId }]
