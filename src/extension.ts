@@ -98,7 +98,7 @@ function getSidecarConfig(): SidecarEntry[] {
   }
 }
 
-function getLegacySidecarConfig(): SidecarEntry[] {
+export function getLegacySidecarConfig(): SidecarEntry[] {
   const legacyConfigs: { lang: string; hostEnv: string; portEnv: string }[] = [
     { lang: 'java', hostEnv: 'LS_JAVA_HOST', portEnv: 'LS_JAVA_PORT' },
     { lang: 'rust', hostEnv: 'LS_RUST_HOST', portEnv: 'LS_RUST_PORT' }
@@ -109,10 +109,16 @@ function getLegacySidecarConfig(): SidecarEntry[] {
     const host = process.env[cfg.hostEnv] || process.env['LS_HOST'] || DEFAULT_HOST;
     const port = process.env[cfg.portEnv] || process.env['LS_PORT'];
     if (port) {
+      // Validate the whole string before converting. parseInt would turn
+      // '8080junk' into 8080 and silently select a different endpoint, so a
+      // value with trailing junk is rejected here (surfaced as NaN, which the
+      // port check in startClient refuses).
+      const trimmed = port.trim();
+      const parsedPort = /^\d+$/.test(trimmed) ? parseInt(trimmed, 10) : NaN;
       entries.push({
         name: cfg.lang + '-langserver',
         host,
-        port: parseInt(port, 10),
+        port: parsedPort,
         languages: [cfg.lang]
       });
     }
@@ -131,8 +137,20 @@ function connectWithRetry(host: string, port: number, languageId: string, token?
         // Optional shared-token handshake, sent before the LSP stream starts.
         // A cooperating server consumes this line and rejects clients without a
         // valid token. Off by default; no token means the stream is unchanged.
+        //
+        // The socket is plain TCP with no TLS, so the token is only sent to
+        // loopback. Writing it to a remote endpoint would expose it in cleartext
+        // on the network; remote endpoints need an authenticated encrypted
+        // channel (mTLS) before a token can be sent, which is out of scope here.
         if (token) {
-          socket.write(`X-LS-Auth: ${token}\r\n`);
+          if (isLoopbackHost(host)) {
+            socket.write(`X-LS-Auth: ${token}\r\n`);
+          } else {
+            console.warn(
+              `[SIDECAR] Not sending auth token to non-loopback host '${host}': ` +
+              `the connection is plaintext TCP and would expose the token.`
+            );
+          }
         }
         resolve({ reader: socket, writer: socket });
       });
