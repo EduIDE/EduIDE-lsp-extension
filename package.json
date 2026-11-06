@@ -46,5 +46,10 @@
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
+  },
+  "overrides": {
+    "mocha": {
+      "serialize-javascript": "^7.1.3"
+    }
   }
 }
