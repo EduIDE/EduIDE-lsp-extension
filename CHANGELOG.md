@@ -8,3 +8,4 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 - Initial release
 - Update vulnerable transitive dependencies to fix open Dependabot security alerts
+- Add a CI workflow that runs lint and tests on pull requests and pushes to `main`
