@@ -18,3 +18,7 @@ This is part of a research project at the Technical University of Munich.
 ## Configuration
 
 This extension can be configured via the standard VS Code settings. Currently, the host and port are hard-coded in `extension.ts` but can be externalized to the settings in a future version.
+
+## Development
+
+Run `npm ci`, then `npm run lint` and `npm test`. The tests launch VS Code through `vscode-test`; on a headless Linux machine run them as `xvfb-run -a npm test`, which is what CI does on every pull request and push to `main`.
